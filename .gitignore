@@ -4,4 +4,4 @@
 .env
 __pycache__
 .chainlit/translations/*.json
-*.md
+CHAT_HISTORY_FEATURE.md
