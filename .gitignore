@@ -1,0 +1,7 @@
+.files
+.chainlit
+.venv
+.env
+__pycache__
+.chainlit/translations/*.json
+*.md

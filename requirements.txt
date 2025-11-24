@@ -1,0 +1,72 @@
+# ============================================
+# Sobeyes Agent Application - Requirements
+# ============================================
+# Install with: pip install -r requirements.txt
+# Or with UV: uv pip install -r requirements.txt
+
+# Core scientific computing
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# MLflow experiment tracking
+mlflow>=2.9.0
+
+# LangChain ecosystem - Core
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+
+# LangChain integrations
+langchain-openai>=0.2.0
+
+# LangGraph for multi-agent systems
+langgraph>=0.2.0
+langmem>=0.0.27  # Memory management and summarization
+
+# Chainlit for UI
+chainlit>=1.0.0
+
+# Azure SDKs
+azure-cosmos>=4.5.0
+azure-identity>=1.15.0
+
+# Web search (optional)
+tavily-python>=0.3.0
+
+# Utilities
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+typing-extensions>=4.8.0
+python-dotenv>=1.0.0
+
+# HTTP and async
+aiohttp>=3.9.0
+httpx>=0.25.0
+
+# JSON and data handling
+orjson>=3.9.0
+
+# Development tools (optional)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.12.0
+ruff>=0.1.0
+
+# ============================================
+# Installation Notes:
+# ============================================
+# Create virtual environment:
+#   python -m venv .venv
+#   .venv\Scripts\activate  (Windows)
+#   source .venv/bin/activate  (Linux/Mac)
+#
+# Install dependencies:
+#   pip install -r requirements.txt
+#
+# Or with UV (recommended):
+#   pip install uv
+#   uv pip install -r requirements.txt
+# ============================================
