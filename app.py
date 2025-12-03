@@ -6,17 +6,24 @@ Handles all Chainlit-specific UI interactions and event handlers
 import uuid
 import logging
 import chainlit as cl
+from chainlit.types import ThreadDict
+from chainlit.user import User
 from langchain_core.messages import HumanMessage, AIMessage
 from datetime import datetime
 
-from config import AzureConfig
-from graph_builder import GraphBuilder
+from src.sobeyes_agent.config import AzureConfig
+from src.sobeyes_agent.graph import GraphBuilder
+from src.sobeyes_agent.storage.chainlit_cosmos import CosmosDataLayer
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [%(levelname)s] - %(name)s - %(message)s',
     datefmt='%H:%M:%S'
+#     handlers=[
+#         logging.FileHandler("log.txt", mode='a'),
+#         logging.StreamHandler()
+#     ]
 )
 logger = logging.getLogger(__name__)
 
@@ -28,68 +35,153 @@ graph = graph_builder.get_graph()
 facts_store = azure_config.get_facts_store()
 conversation_store = azure_config.get_conversation_store()
 agent_nodes = graph_builder.agent_nodes
-tavily_available = azure_config.get_tavily_tool() is not None
+
+# Initialize Chainlit Data Layer for History Sidebar
+cl.data_layer = CosmosDataLayer(azure_config)
 
 
 # ===== Chainlit Event Handlers =====
 
+@cl.password_auth_callback
+def auth_callback(username, password):
+    """
+    Simple authentication callback to enable the History Sidebar.
+    """
+    # Static credentials for demonstration
+    if username == "admin" and password == "admin":
+        return User(identifier=username)
+    return None
+
 @cl.on_chat_start
 async def on_chat_start():
-    """Initialize chat session with previous conversations sidebar"""
+    """Initialize chat session"""
     logger.info("="*60)
     logger.info("NEW CHAT SESSION STARTED")
     logger.info("="*60)
     
     # Use consistent user_id for memory persistence across sessions
-    user_id = cl.user_session.get("user").identifier if cl.user_session.get("user") else "default_user"
+    user_obj = cl.user_session.get("user")
+    logger.info(f"DEBUG: Authenticated User: {user_obj}")
+    user_id = user_obj.identifier if user_obj else "default_user"
+    
+    # Attempt to find the most recent thread for "Resume" option
+    latest_thread_id = None
+    
+    try:
+        # Create filter and pagination for listing threads
+        from chainlit.types import Pagination, ThreadFilter
+        pagination = Pagination(first=1)
+        # Note: ThreadFilter fields may vary by version, using kwargs to be safe or standard field
+        # Try passing both to cover different Chainlit versions
+        try:
+            thread_filter = ThreadFilter(userIdentifier=user_id, userId=user_id)
+        except:
+            thread_filter = ThreadFilter(userIdentifier=user_id)
+        
+        # List threads to find the most recent one
+        response = await cl.data_layer.list_threads(pagination, thread_filter)
+        if response.data:
+            latest_thread = response.data[0]
+            latest_thread_id = latest_thread["id"]
+            logger.info(f"Found existing thread for resume option: {latest_thread_id}")
+    except Exception as e:
+        logger.error(f"Failed to fetch existing threads: {e}")
+    
+    # Always create a new thread for the current session
     thread_id = f"thread_{uuid.uuid4().hex}"
+    logger.info(f"Created new thread: {thread_id}")
     
     logger.info(f"Session Configuration:")
     logger.info(f"  - User ID: {user_id}")
     logger.info(f"  - Thread ID: {thread_id}")
-    logger.info(f"  - Tavily Available: {tavily_available}")
     logger.info(f"  - Facts Store: {'Connected' if facts_store else 'In-memory only'}")
     logger.info(f"  - Conversation Store: {'Connected' if conversation_store else 'In-memory only'}")
     
-    print(f"🔑 Session started with user_id: {user_id}, thread_id: {thread_id}")
+    print(f"Session started with user_id: {user_id}, thread_id: {thread_id}")
     
     # Store in session
     cl.user_session.set("user_id", user_id)
     cl.user_session.set("thread_id", thread_id)
     cl.user_session.set("user_role", None)  # Will be set when user shares their role
     
-    # Load previous sessions for this user and display in sidebar
-    if conversation_store:
-        try:
-            sessions = await agent_nodes.get_user_sessions(user_id)
-            if sessions:
-                logger.info(f"[CHAT HISTORY] Found {len(sessions)} previous sessions for user {user_id}")
-                
-                # Display previous sessions as actions in the chat
-                sessions_text = "## 📜 Your Previous Conversations\n\n"
-                actions = []
-                
-                for idx, session in enumerate(sessions[:10]):  # Show last 10 sessions
-                    sessions_text += f"{idx+1}. **{session['datetime']}**\n   _{session['preview']}_\n\n"
-                    actions.append(
-                        cl.Action(
-                            name="load_session",
-                            value=session['thread_id'],
-                            label=f"Load Session {idx+1}"
-                        )
-                    )
-                
-                # Send as a message with actions
-                await cl.Message(
-                    content=sessions_text,
-                    actions=actions
-                ).send()
-        except Exception as e:
-            logger.error(f"[CHAT HISTORY] Failed to load previous sessions: {e}")
-    
+    # Prepare welcome message actions
+    actions = []
+    if latest_thread_id:
+        actions.append(
+            cl.Action(
+                name="resume_thread", 
+                value=latest_thread_id, 
+                label="Resume Last Conversation",
+                description="Continue from your most recent chat",
+                payload={"value": latest_thread_id}
+            )
+        )
+
     await cl.Message(
         content=f"Hello! I'm your assistant with memory.\n\n"
-                f"How can I help you today?"
+                f"How can I help you today?",
+        actions=actions
+    ).send()
+
+
+@cl.action_callback("resume_thread")
+async def on_resume_thread(action: cl.Action):
+    """Action to resume a specific thread"""
+    # Safely retrieve value from payload or attribute
+    thread_id = action.payload.get("value") if action.payload else None
+    if not thread_id:
+        thread_id = getattr(action, "value", None)
+        
+    user_id = cl.user_session.get("user_id")
+    
+    logger.info(f"User {user_id} requested to resume thread {thread_id}")
+    
+    # Update session
+    cl.user_session.set("thread_id", thread_id)
+    
+    # Clear UI
+    await cl.Message(content="Resuming conversation...").send()
+    
+    # Fetch and display history
+    try:
+        steps = await cl.data_layer.get_steps(thread_id)
+        if steps:
+            for step in steps:
+                if step["type"] == "user_message":
+                    await cl.Message(
+                        content=step["content"], 
+                        author="You", 
+                        type="user_message"
+                    ).send()
+                elif step["type"] == "assistant_message":
+                    await cl.Message(
+                        content=step["content"], 
+                        author="Assistant", 
+                        type="assistant_message"
+                    ).send()
+            
+            await cl.Message(content="--- Conversation Resumed ---").send()
+    except Exception as e:
+        logger.error(f"Failed to restore steps: {e}")
+        await cl.Message(content=f"Error resuming conversation: {e}").send()
+
+
+@cl.on_chat_resume
+async def on_chat_resume(thread: ThreadDict):
+    """Resume a chat session from history"""
+    logger.info("="*60)
+    logger.info(f"RESUMING CHAT SESSION: {thread['id']}")
+    logger.info("="*60)
+    
+    user_id = thread.get("userIdentifier") or "default_user"
+    thread_id = thread["id"]
+    
+    cl.user_session.set("user_id", user_id)
+    cl.user_session.set("thread_id", thread_id)
+    cl.user_session.set("user_role", None) # Reset or load from metadata if available
+    
+    await cl.Message(
+        content=f"Welcome back! I've restored your conversation context."
     ).send()
 
 
@@ -104,13 +196,13 @@ async def on_message(message: cl.Message):
     if message.content.startswith("/search "):
         query = message.content[8:].strip()
         if conversation_store and query:
-            await cl.Message(content=f"🔍 Searching your conversation history for: *{query}*...").send()
+            await cl.Message(content=f"Searching your conversation history for: *{query}*...").send()
             
             try:
                 results = await agent_nodes.search_conversation_history(user_id, query, top_k=5)
                 
                 if results:
-                    search_results = "## 🔍 Relevant Past Conversations\n\n"
+                    search_results = "## Relevant Past Conversations\n\n"
                     for conv in results:
                         search_results += f"### {conv['datetime']} (Session: {conv['thread_id'][:8]}...)\n"
                         search_results += f"**You:** {conv['user_message']}\n\n"
@@ -122,7 +214,7 @@ async def on_message(message: cl.Message):
                     await cl.Message(content="No relevant conversations found.").send()
             except Exception as e:
                 logger.error(f"Semantic search error: {e}")
-                await cl.Message(content=f"❌ Search failed: {str(e)}").send()
+                await cl.Message(content=f"Search failed: {str(e)}").send()
         else:
             await cl.Message(content="Usage: `/search <your query>` - Search your conversation history semantically").send()
         return
@@ -134,7 +226,7 @@ async def on_message(message: cl.Message):
             if role_keyword in message.content.lower():
                 user_role = role_keyword.title()
                 cl.user_session.set("user_role", user_role)
-                await cl.Message(content=f"✓ I'll remember you're a {user_role}!").send()
+                await cl.Message(content=f"I'll remember you're a {user_role}!").send()
                 break
     
     # Prepare config for agent with user role context
@@ -257,12 +349,12 @@ async def on_message(message: cl.Message):
             metadata_msgs.append(f"**Routing**: {routing[-1]}")
         
         if memories_used > 0:
-            metadata_msgs.append(f"📚 Retrieved {memories_used} relevant facts from long-term memory")
+            metadata_msgs.append(f"Retrieved {memories_used} relevant facts from long-term memory")
         
         if exec_times:
             agent_name = list(exec_times.keys())[-1]
             duration = exec_times[agent_name]
-            metadata_msgs.append(f"⏱️ {agent_name} execution: {duration:.2f}s")
+            metadata_msgs.append(f"{agent_name} execution: {duration:.2f}s")
         
         # Send metadata as a single message
         if metadata_msgs:
@@ -275,10 +367,10 @@ async def on_message(message: cl.Message):
             
             if not msg.content:  # If no streaming occurred
                 await msg.update(content=f"**{agent_name} Response:**\n\n{assistant_response}\n\n"
-                                        "💬 *Feel free to provide feedback, ask follow-up questions, or request changes!*")
+                                        "*Feel free to provide feedback, ask follow-up questions, or request changes!*")
             else:
                 # Append annotation
-                await cl.Message(content="💬 *Feel free to provide feedback, ask follow-up questions, or request changes!*").send()
+                await cl.Message(content="*Feel free to provide feedback, ask follow-up questions, or request changes!*").send()
         elif result and "messages" in result and not msg.content:
             # Fallback: if streaming didn't work, send final message
             # Extract AI messages correctly - filter by type, then get content
@@ -291,7 +383,7 @@ async def on_message(message: cl.Message):
         # Human can naturally continue the conversation with feedback/corrections
         
     except Exception as e:
-        await cl.Message(content=f"❌ Error: {str(e)}").send()
+        await cl.Message(content=f"Error: {str(e)}").send()
         print(f"Error details: {e}")
 
 
@@ -302,69 +394,23 @@ async def on_store_fact(action: cl.Action):
     namespace = ("user_facts", user_id)
     
     # Simple fact extraction (in production, use NER or LLM extraction)
-    fact_text = action.value
+    fact_text = action.payload.get("value") if action.payload else None
+    if not fact_text:
+        # Fallback if value is available directly (older versions)
+        fact_text = getattr(action, "value", None)
+        
+    if not fact_text:
+        await cl.Message(content="Error: Could not retrieve fact text").send()
+        return
+
     fact_key = f"fact_{datetime.utcnow().timestamp()}"
     
     await facts_store.aput(namespace, fact_key, {"fact": fact_text})
     
-    await cl.Message(content=f"✓ Stored fact: {fact_text}").send()
+    await cl.Message(content=f"Stored fact: {fact_text}").send()
 
 
-@cl.action_callback("load_session")
-async def on_load_session(action: cl.Action):
-    """Action to load a previous chat session"""
-    user_id = cl.user_session.get("user_id")
-    thread_id = action.value
-    
-    if not conversation_store:
-        await cl.Message(content="❌ Conversation store not available").send()
-        return
-    
-    try:
-        logger.info(f"[CHAT HISTORY] Loading session: {thread_id}")
-        
-        # Get the conversation history for this session
-        history = await agent_nodes.get_session_history(user_id, thread_id)
-        
-        if not history:
-            await cl.Message(content="No conversation history found for this session.").send()
-            return
-        
-        # Display the conversation history
-        history_text = f"## 📜 Previous Conversation (Session: {thread_id[:8]}...)\n\n"
-        for turn in history:
-            history_text += f"**You ({turn['datetime']}):** {turn['user_message']}\n\n"
-            history_text += f"**Assistant:** {turn['assistant_message']}\n\n"
-            history_text += "---\n\n"
-        
-        await cl.Message(content=history_text).send()
-        
-        # Option to continue this session
-        await cl.Message(
-            content="💡 You're viewing a previous conversation. You can:\n"
-                   "- Continue chatting in your current session\n"
-                   "- Or type `/resume` to continue this previous conversation"
-        ).send()
-        
-        # Store the loaded thread_id for potential resume
-        cl.user_session.set("loaded_thread_id", thread_id)
-        
-    except Exception as e:
-        logger.error(f"[CHAT HISTORY] Failed to load session: {e}")
-        await cl.Message(content=f"❌ Failed to load conversation: {str(e)}").send()
 
-
-@cl.on_settings_update
-async def on_settings_update(settings):
-    """Handle settings panel interactions"""
-    user_id = cl.user_session.get("user_id")
-    
-    # Check if a session button was clicked
-    for key, value in settings.items():
-        if key.startswith("session_") and value:
-            thread_id = key.replace("session_", "")
-            await on_load_session(cl.Action(name="load_session", value=thread_id))
-            break
 
 
 if __name__ == "__main__":

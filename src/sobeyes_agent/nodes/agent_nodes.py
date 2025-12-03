@@ -13,7 +13,7 @@ Memory Architecture:
 Security Notes:
 - SQL queries are encapsulated in store methods to prevent SQL injection
 - Never expose raw SQL query construction to user input
-- All Cosmos DB queries use parameterized operations through the AsyncCosmosDBStore interface
+- All Cosmos DB queries use parameterized operations through the CosmosDBStore interface
 """
 
 import time
@@ -22,6 +22,7 @@ from datetime import datetime
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.types import Command
+from ..models import FactExtraction
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +32,12 @@ try:
     LANGMEM_AVAILABLE = True
 except ImportError:
     LANGMEM_AVAILABLE = False
-    print("⚠ Warning: langmem not installed. Using basic summarization. Install with: uv pip install langmem")
 
 
 class AgentNodes:
     """Collection of agent nodes for the multi-agent system"""
     
-    def __init__(self, model, facts_store, routing_chain, conversation_store=None, tavily_tool=None):
+    def __init__(self, model, facts_store, routing_chain, conversation_store=None):
         """Initialize agent nodes with shared resources
         
         Args:
@@ -45,7 +45,6 @@ class AgentNodes:
             facts_store: CosmosDBStore for long-term user facts
             routing_chain: LLM chain for routing decisions
             conversation_store: CosmosDBStore for persistent conversation history
-            tavily_tool: Optional Tavily search tool
         
         Note: Chat history managed by checkpointer AND persisted to Cosmos DB
         """
@@ -53,7 +52,6 @@ class AgentNodes:
         self.facts_store = facts_store
         self.conversation_store = conversation_store
         self.routing_chain = routing_chain
-        self.tavily_tool = tavily_tool
     
     async def _extract_and_store_facts(self, user_query: str, user_id: str):
         """Extract personal facts from user query and store in Cosmos DB
@@ -70,8 +68,14 @@ class AgentNodes:
         
         logger.info("\n[FACT EXTRACTION] Analyzing query for personal information...")
         
-        # Use LLM to extract facts
+        # Use LLM to extract facts with structured output
         extraction_prompt = f"""Analyze the following user message and extract ONLY personal facts that should be remembered long-term.
+Categorize each fact into one of the following categories:
+- marketing_insights: Facts related to marketing strategies, campaigns, or market data
+- optimization: Facts related to process or system optimization preferences
+- inference: Facts derived from analysis or logical deduction
+- user_preference: Explicit user preferences or settings
+- general: Other personal facts
 
 Extract facts like:
 - Name (e.g., "User's name is Maria")
@@ -86,60 +90,71 @@ DO NOT extract:
 - General conversation
 
 User message: "{user_query}"
-
-Respond with a JSON array of facts, or empty array [] if no personal facts found.
-Format: ["fact1", "fact2", ...]
-
-Example output: ["User's name is Maria", "Prefers beach vacations", "Travels with family of 4"]
-
-Facts:"""
+"""
         
         try:
-            response = self.model.invoke([SystemMessage(content=extraction_prompt)])
-            facts_text = response.content.strip()
+            structured_llm = self.model.with_structured_output(FactExtraction)
+            result = structured_llm.invoke([SystemMessage(content=extraction_prompt)])
             
-            # Parse JSON response
-            import json
-            # Remove markdown code blocks if present
-            if "```" in facts_text:
-                facts_text = facts_text.split("```")[1]
-                if facts_text.startswith("json"):
-                    facts_text = facts_text[4:]
-            facts_text = facts_text.strip()
-            
-            facts = json.loads(facts_text)
-            
-            if not facts or len(facts) == 0:
+            if not result or not result.facts:
                 logger.info("[FACT EXTRACTION] No personal facts detected")
                 return 0
             
-            logger.info(f"[FACT EXTRACTION] ✓ Extracted {len(facts)} fact(s):")
-            for idx, fact in enumerate(facts, 1):
-                logger.info(f"  {idx}. {fact}")
+            logger.info(f"[FACT EXTRACTION] Extracted {len(result.facts)} fact(s):")
+            for idx, fact in enumerate(result.facts, 1):
+                logger.info(f"  {idx}. [{fact.category}] {fact.text}")
             
             # Store facts in Cosmos DB
             logger.info("\n[FACT STORAGE] Storing facts in Cosmos DB...")
             namespace = ("user_facts", user_id)
             stored_count = 0
             
-            for idx, fact in enumerate(facts):
+            for idx, fact in enumerate(result.facts):
+                # Deduplication check: Search for semantically similar facts
+                try:
+                    existing = await self.facts_store.asearch(namespace, query=fact.text, limit=1)
+                    if existing:
+                        # Check similarity score (Cosmos DB VectorDistance returns cosine similarity)
+                        similarity = getattr(existing[0], 'similarity_score', None)
+                        if similarity is None and isinstance(existing[0].value, dict):
+                            similarity = existing[0].value.get("_similarity_score", 0)
+                        
+                        # If > 0.85, it's likely a duplicate or very close variation
+                        if similarity and similarity > 0.85:
+                            logger.info(f"  Skipping duplicate fact (similarity {similarity:.2f}): {fact.text}")
+                            continue
+                except Exception as e:
+                    logger.warning(f"  Deduplication check failed: {e}")
+
                 key = f"fact_{int(time.time())}_{idx}"
                 try:
-                    await self.facts_store.aput(namespace, key, {"text": fact, "fact": fact})
+                    # Store structured fact
+                    fact_data = {
+                        "text": fact.text,
+                        "fact": fact.text,
+                        "category": fact.category.value,
+                        "source": "user_interaction",
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                    
+                    # Use multi-field embedding: Embed both text and category
+                    # This allows searching for "marketing facts" or specific content
+                    await self.facts_store.aput(
+                        namespace, 
+                        key, 
+                        fact_data, 
+                        index=["text", "category"]
+                    )
                     stored_count += 1
-                    logger.info(f"  ✓ Stored: {fact}")
+                    logger.info(f"  Stored: {fact.text}")
                 except Exception as e:
-                    logger.error(f"  ✗ Failed to store fact: {e}")
+                    logger.error(f"  Failed to store fact: {e}")
             
-            logger.info(f"\n[FACT STORAGE] ✓ Successfully stored {stored_count}/{len(facts)} facts in Cosmos DB")
-            print(f"✓ Stored {stored_count} new fact(s) in Cosmos DB")
+            logger.info(f"\n[FACT STORAGE] Successfully stored {stored_count}/{len(result.facts)} facts in Cosmos DB")
+            print(f"Stored {stored_count} new fact(s) in Cosmos DB")
             
             return stored_count
             
-        except json.JSONDecodeError as e:
-            logger.warning(f"[FACT EXTRACTION] Failed to parse LLM response as JSON: {e}")
-            logger.debug(f"[FACT EXTRACTION] Raw response: {facts_text}")
-            return 0
         except Exception as e:
             logger.error(f"[FACT EXTRACTION] Error: {e}")
             import traceback
@@ -173,7 +188,7 @@ Facts:"""
             conversation_text = f"User: {user_message}\nAssistant: {assistant_message}"
             
             # Store the conversation turn with text for embedding
-            # AsyncCosmosDBStore will automatically create embeddings from the text
+            # CosmosDBStore will automatically create embeddings from the text
             turn_data = {
                 "text": conversation_text,  # This field will be embedded
                 "timestamp": timestamp,
@@ -186,14 +201,14 @@ Facts:"""
             key = f"turn_{timestamp}"
             await self.conversation_store.aput(namespace, key, turn_data)
             
-            logger.info(f"[CONVERSATION STORAGE] ✓ Saved conversation turn with embeddings")
+            logger.info(f"[CONVERSATION STORAGE] Saved conversation turn with embeddings")
             logger.info(f"  - User: {user_message[:80]}..." if len(user_message) > 80 else f"  - User: {user_message}")
             logger.info(f"  - Assistant: {assistant_message[:80]}..." if len(assistant_message) > 80 else f"  - Assistant: {assistant_message}")
             logger.info(f"  - Embedding text length: {len(conversation_text)} chars")
-            print(f"✓ Saved conversation turn to Cosmos DB with embeddings")
+            print(f"Saved conversation turn to Cosmos DB with embeddings")
             
         except Exception as e:
-            logger.error(f"[CONVERSATION STORAGE] ✗ Failed to save conversation: {e}")
+            logger.error(f"[CONVERSATION STORAGE] Failed to save conversation: {e}")
             import traceback
             traceback.print_exc()
     
@@ -243,11 +258,11 @@ Facts:"""
             # Sort by timestamp (newest first)
             sorted_sessions = sorted(sessions.values(), key=lambda x: x["timestamp"], reverse=True)
             
-            logger.info(f"[CONVERSATION RETRIEVAL] ✓ Found {len(sorted_sessions)} unique sessions")
+            logger.info(f"[CONVERSATION RETRIEVAL] Found {len(sorted_sessions)} unique sessions")
             return sorted_sessions
             
         except Exception as e:
-            logger.error(f"[CONVERSATION RETRIEVAL] ✗ Failed to fetch sessions: {e}")
+            logger.error(f"[CONVERSATION RETRIEVAL] Failed to fetch sessions: {e}")
             import traceback
             traceback.print_exc()
             return []
@@ -292,11 +307,11 @@ Facts:"""
             
             turns.sort(key=lambda x: x["timestamp"])
             
-            logger.info(f"[CONVERSATION RETRIEVAL] ✓ Retrieved {len(turns)} conversation turns")
+            logger.info(f"[CONVERSATION RETRIEVAL] Retrieved {len(turns)} conversation turns")
             return turns
             
         except Exception as e:
-            logger.error(f"[CONVERSATION RETRIEVAL] ✗ Failed to fetch history: {e}")
+            logger.error(f"[CONVERSATION RETRIEVAL] Failed to fetch history: {e}")
             import traceback
             traceback.print_exc()
             return []
@@ -336,7 +351,9 @@ Facts:"""
             relevant_conversations = []
             for idx, item in enumerate(items):
                 value = item.value
-                similarity = getattr(item, 'similarity_score', None) or getattr(item, 'score', 'N/A')
+                similarity = getattr(item, 'similarity_score', None) or getattr(item, 'score', None)
+                if similarity is None and isinstance(value, dict):
+                    similarity = value.get("_similarity_score", 'N/A')
                 
                 relevant_conversations.append({
                     "rank": idx + 1,
@@ -348,7 +365,7 @@ Facts:"""
                     "datetime": datetime.fromtimestamp(value.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M:%S")
                 })
             
-            logger.info(f"[CONVERSATION SEARCH] ✓ Found {len(relevant_conversations)} relevant conversations")
+            logger.info(f"[CONVERSATION SEARCH] Found {len(relevant_conversations)} relevant conversations")
             for conv in relevant_conversations:
                 logger.info(f"  #{conv['rank']} (similarity: {conv['similarity']}) - {conv['datetime']}")
                 logger.info(f"    User: {conv['user_message'][:60]}...")
@@ -356,23 +373,20 @@ Facts:"""
             return relevant_conversations
             
         except Exception as e:
-            logger.error(f"[CONVERSATION SEARCH] ✗ Failed to search conversations: {e}")
+            logger.error(f"[CONVERSATION SEARCH] Failed to search conversations: {e}")
             import traceback
             traceback.print_exc()
             return []
     
-    def summarization_node(self, state, config: RunnableConfig):
-        """Summarize user input before passing to agents
+    def custom_summarization_node(self, state, config: RunnableConfig):
+        """Summarize user input before passing to agents (Legacy Custom Implementation)
         
         Creates a concise summary of the user's query to improve:
         - Memory retrieval accuracy
         - Routing decision quality
         - Agent response relevance
-        
-        Uses langmem if available for advanced summarization with token management.
-        Falls back to simple LLM-based summarization otherwise.
         """
-        logger.info("\n[SUMMARIZATION NODE] Starting...")
+        logger.info("\n[SUMMARIZATION NODE] Starting (Custom)...")
         start_time = time.time()
         
         # Get user query - extract HumanMessage correctly
@@ -388,12 +402,10 @@ Facts:"""
         # Check if query is already concise (< 100 chars)
         if len(user_query) < 100:
             summary = user_query
-            logger.info("[SUMMARIZATION NODE] ✓ Query is concise, no summarization needed")
+            logger.info("[SUMMARIZATION NODE] Query is concise, no summarization needed")
             print("Query is concise, no summarization needed")
         else:
             # Generate summary using LLM
-            # Note: For production, consider using langmem's summarize_messages
-            # for automatic token management and conversation summarization
             logger.info("[SUMMARIZATION NODE] Query is long, generating summary...")
             
             summary_prompt = f"""Summarize the following user query into a concise search query (1-2 sentences max).
@@ -406,7 +418,7 @@ Summary:"""
             response = self.model.invoke([SystemMessage(content=summary_prompt)])
             summary = response.content.strip()
             
-            logger.info(f"[SUMMARIZATION NODE] ✓ Summarized query:")
+            logger.info(f"[SUMMARIZATION NODE] Summarized query:")
             logger.info(f"  Original ({len(user_query)} chars): {user_query[:80]}...")
             logger.info(f"  Summary ({len(summary)} chars): {summary}")
             print(f"Summarized: '{user_query[:50]}...' -> '{summary}'")
@@ -550,51 +562,7 @@ Provide a detailed, analytical response. Include calculations, insights, and rea
             }
         )
     
-    def search_node(self, state):
-        """Search agent - handles web searches (no HITL) - Disabled if Tavily not configured"""
-        logger.info("\n[SEARCH NODE] Starting web search...")
-        
-        # Redirect to Analyst if Search is called without Tavily
-        if not self.tavily_tool:
-            logger.warning("[SEARCH NODE] Tavily not configured, redirecting to Analyst")
-            print("Search agent called but Tavily not configured, redirecting to Analyst")
-            return {"next": "Analyst"}
-        
-        start_time = time.time()
-        
-        # Extract user query correctly
-        human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
-        if not human_messages:
-            logger.warning("[SEARCH NODE] No search query provided")
-            return {"messages": [AIMessage(content="No search query provided.", name="Search")], "next": "FINISH"}
-        user_query = human_messages[-1].content
-        
-        logger.info(f"[SEARCH NODE] Query: {user_query[:100]}..." if len(user_query) > 100 else f"[SEARCH NODE] Query: {user_query}")
-        
-        # Use summarized query if available
-        search_query = state.get("query_intent", user_query)
-        logger.info(f"[SEARCH NODE] Search query: {search_query[:100]}..." if len(search_query) > 100 else f"[SEARCH NODE] Search query: {search_query}")
-        
-        try:
-            results = self.tavily_tool.invoke({"query": search_query})
-            
-            if results:
-                response = "Search Results:\n\n"
-                for idx, result in enumerate(results, 1):
-                    response += f"{idx}. {result.get('content', '')}\n"
-                    response += f"   Source: {result.get('url', '')}\n\n"
-            else:
-                response = "No results found."
-        except Exception as e:
-            response = f"Search error: {str(e)}"
-        
-        execution_time = time.time() - start_time
-        
-        return {
-            "messages": [AIMessage(content=response, name="Search")],
-            "execution_times": {"Search": execution_time},
-            "next": "FINISH"
-        }
+
     
     async def supervisor_node(self, state, config: RunnableConfig):
         """Supervisor orchestrates routing and memory retrieval (async)"""
@@ -604,7 +572,7 @@ Provide a detailed, analytical response. Include calculations, insights, and rea
             sender = getattr(last_msg, "name", None)
             
             # If agent responded, save conversation and extract facts, then finish
-            if sender in ["Analyst", "Search", "Tools"]:
+            if sender in ["Analyst", "Tools"]:
                 human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
                 ai_messages = [m for m in state["messages"] if isinstance(m, AIMessage)]
                 
@@ -659,7 +627,7 @@ Provide a detailed, analytical response. Include calculations, insights, and rea
                 # Semantic search across all conversations for this user
                 history_items = await self.conversation_store.asearch(namespace_prefix, query=search_query, limit=5)
                 if history_items:
-                    logger.info(f"  - ✓ Retrieved {len(history_items)} relevant conversations from chat history")
+                    logger.info(f"  - Retrieved {len(history_items)} relevant conversations from chat history")
                     for idx, item in enumerate(history_items, 1):
                         conv_data = item.value
                         text = f"Previous conversation: User: {conv_data.get('user_message', '')} | Assistant: {conv_data.get('assistant_message', '')}"
@@ -669,7 +637,7 @@ Provide a detailed, analytical response. Include calculations, insights, and rea
                 else:
                     logger.info(f"  - No relevant conversations found in chat history")
             except Exception as e:
-                logger.error(f"  - ✗ Chat history retrieval error: {e}")
+                logger.error(f"  - Chat history retrieval error: {e}")
                 print(f"Chat history retrieval error: {e}")
                 import traceback
                 traceback.print_exc()
@@ -684,12 +652,12 @@ Provide a detailed, analytical response. Include calculations, insights, and rea
                 facts_items = await self.facts_store.asearch(namespace, query=search_query, limit=5)
                 if facts_items:
                     memories = [{"text": m.value.get("text", m.value.get("fact", str(m.value)))} for m in facts_items]
-                    logger.info(f"  - ✓ Retrieved {len(memories)} facts")
+                    logger.info(f"  - Retrieved {len(memories)} facts")
                     print(f"Retrieved {len(memories)} facts from user facts store")
                 else:
                     logger.info(f"  - No facts found")
             except Exception as e:
-                logger.error(f"  - ✗ Fact retrieval error: {e}")
+                logger.error(f"  - Fact retrieval error: {e}")
         
         if not self.conversation_store and not self.facts_store:
             logger.info(f"  - Skipping long-term memory (running in-memory only mode)")
@@ -700,7 +668,7 @@ Provide a detailed, analytical response. Include calculations, insights, and rea
         
         decision = self.routing_chain.invoke({"query": user_query})
         
-        logger.info(f"  - ✓ Agent Selected: {decision.agent}")
+        logger.info(f"  - Agent Selected: {decision.agent}")
         logger.info(f"  - Reasoning: {decision.reasoning}")
         
         print(f"Routing to {decision.agent}: {decision.reasoning}")

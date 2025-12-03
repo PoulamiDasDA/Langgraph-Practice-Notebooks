@@ -2,10 +2,31 @@
 Pydantic Models for Type Safety and Validation
 """
 
-from typing import Optional, Literal, Annotated
+from typing import Optional, Literal, Annotated, List
 from operator import add
+from enum import Enum
 from pydantic import BaseModel, Field
 from langgraph.graph import MessagesState
+
+
+# ===== Fact Extraction Models =====
+
+class FactCategory(str, Enum):
+    """Categories for long-term memory facts"""
+    MARKETING_INSIGHTS = "marketing_insights"
+    OPTIMIZATION = "optimization"
+    INFERENCE = "inference"
+    USER_PREFERENCE = "user_preference"
+    GENERAL = "general"
+
+class Fact(BaseModel):
+    """Structured fact with categorization"""
+    category: FactCategory = Field(..., description="Category of the extracted fact")
+    text: str = Field(..., description="The extracted fact text")
+
+class FactExtraction(BaseModel):
+    """Container for extracted facts"""
+    facts: List[Fact] = Field(default_factory=list, description="List of extracted facts")
 
 
 # ===== Request/Response Models =====
@@ -35,7 +56,7 @@ class ChatResponse(BaseModel):
 
 class RouteDecision(BaseModel):
     """Routing decision model for supervisor agent"""
-    agent: Literal["Analyst", "Search"]
+    agent: Literal["Analyst"]
     reasoning: str
 
 
@@ -48,7 +69,7 @@ def merge_dicts(existing: dict, new: dict) -> dict:
 
 class State(MessagesState):
     """Agent state with HITL tracking, routing, and memory"""
-    next: Optional[Literal["Analyst", "Search", "FINISH"]] = None
+    next: Optional[Literal["Analyst", "FINISH"]] = None
     user_edits: Annotated[list[dict], add] = []
     execution_times: Annotated[dict[str, float], merge_dicts] = {}
     routing_reasoning: Annotated[list[str], add] = []
