@@ -33,9 +33,6 @@ chainlit>=1.0.0
 azure-cosmos>=4.5.0
 azure-identity>=1.15.0
 
-# Web search (optional)
-tavily-python>=0.3.0
-
 # Utilities
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
